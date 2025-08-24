@@ -125,22 +125,24 @@ class SafeRateLimiter:
             if self.current_rate < self.base_rate:
                 self.current_rate = min(self.current_rate * 1.05, self.base_rate)
                 
-        elif status_code == 429:  # Rate limited
+        elif status_code == 429:  # Rate limited - this is bad, reduce rate
             self.total_rate_limits += 1
             self.consecutive_failures += 1
             self.last_failure_time = time.time()
             self.current_rate *= 0.5
             print(f"⚠️  Rate limited! Reducing rate to {self.current_rate:.2f} req/sec")
             
-        elif status_code >= 500:  # Server errors
+        elif status_code in (0, "TIMEOUT") or str(status_code).startswith("EXC:"):  # Connection issues
             self.total_errors += 1
             self.consecutive_failures += 1
             self.last_failure_time = time.time()
             self.current_rate *= 0.8
-            print(f"⚠️  Server error {status_code}! Reducing rate to {self.current_rate:.2f} req/sec")
+            print(f"⚠️  Connection error {status_code}! Reducing rate to {self.current_rate:.2f} req/sec")
             
-        else:  # Client errors (don't count as failures for circuit breaker)
-            self.consecutive_failures = 0
+        # For cache warming: 503, 404, and other HTTP errors are EXPECTED
+        # Don't reduce rate for these - they're part of normal cache warming process
+        else:
+            self.consecutive_failures = 0  # Reset failures for expected responses
     
     async def _rate_limit(self):
         """Implement token bucket rate limiting"""
@@ -370,7 +372,7 @@ async def check_mbids_concurrent(
                     cfg["timeout_seconds"]
                 )
                 
-                rate_limiter.release(int(last_code) if last_code.isdigit() else 0, response_time)
+                rate_limiter.release(int(last_code) if last_code.isdigit() else last_code, response_time)
                 
                 # Update ledger
                 ledger[mbid].update({
