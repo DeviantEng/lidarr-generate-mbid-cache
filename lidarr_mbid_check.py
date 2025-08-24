@@ -616,11 +616,8 @@ def process_mbids_in_batches(
     return total_transitioned, total_new_successes, total_new_failures
 
 
-# Global for timing
-start_run_time = None
-
+# Remove the global start_run_time since we're now tracking it properly per batch
 def main():
-    global start_run_time
     
     parser = argparse.ArgumentParser(
         description="Query Lidarr for MBIDs, keep a CSV ledger, and probe each MBID against a target endpoint with concurrent processing."
@@ -714,8 +711,7 @@ def main():
         print("Nothing to check - all MBIDs are already successful")
         return
 
-    # Start processing
-    start_run_time = time.time()
+    # Start processing (no global timing needed)
 
     try:
         if cfg.get("batch_size", 25) < len(to_check):
