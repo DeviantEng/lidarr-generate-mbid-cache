@@ -8,7 +8,7 @@ import random
 import sys
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
@@ -591,6 +591,10 @@ def process_mbids_in_batches(
     total_new_successes = 0
     total_new_failures = 0
     
+    # Track timing across all batches
+    overall_start_time = time.time()
+    total_processed = 0
+    
     for batch_idx in range(0, len(to_check), batch_size):
         batch_num = batch_idx // batch_size + 1
         batch = to_check[batch_idx:batch_idx + batch_size]
@@ -598,12 +602,13 @@ def process_mbids_in_batches(
         print(f"=== Batch {batch_num}/{total_batches} ({len(batch)} MBIDs) ===")
         
         batch_transitioned, batch_successes, batch_failures = asyncio.run(
-            check_mbids_concurrent(batch, cfg, ledger, mbid_to_name, mbid_to_lidarr_id)
+            check_mbids_concurrent_with_timing(batch, cfg, ledger, mbid_to_name, mbid_to_lidarr_id, overall_start_time, total_processed)
         )
         
         total_transitioned += batch_transitioned
         total_new_successes += batch_successes
         total_new_failures += batch_failures
+        total_processed += len(batch)
         
         # Write after each batch
         write_ledger(cfg["csv_path"], ledger)
@@ -614,6 +619,121 @@ def process_mbids_in_batches(
             time.sleep(cfg["batch_pause_seconds"])
     
     return total_transitioned, total_new_successes, total_new_failures
+
+
+async def check_mbids_concurrent_with_timing(
+    to_check: List[str],
+    cfg: dict,
+    ledger: dict,
+    mbid_to_name: dict,
+    mbid_to_lidarr_id: dict,
+    overall_start_time: float,
+    offset: int
+) -> Tuple[int, int, int]:
+    """Check MBIDs concurrently with proper timing across batches"""
+    
+    rate_limiter = SafeRateLimiter(
+        requests_per_second=cfg["rate_limit_per_second"],
+        max_concurrent=cfg["max_concurrent_requests"],
+        circuit_breaker_threshold=cfg.get("circuit_breaker_threshold", 25),
+        backoff_factor=cfg.get("backoff_factor", 2.0),
+        max_backoff_seconds=cfg.get("max_backoff_seconds", 60)
+    )
+    
+    transitioned_count = 0
+    new_successes = 0
+    new_failures = 0
+    timeout_obj = aiohttp.ClientTimeout(total=cfg["timeout_seconds"])
+    
+    async with aiohttp.ClientSession(timeout=timeout_obj) as session:
+        for i, mbid in enumerate(to_check):
+            # Check circuit breaker
+            if not await rate_limiter.acquire():
+                print(f"🚫 Circuit breaker open, skipping remaining {len(to_check) - i} MBIDs")
+                break
+            
+            name = mbid_to_name.get(mbid, 'Unknown')
+            prev_status = ledger[mbid].get("status", "").lower()
+            
+            # Use offset for proper numbering across batches
+            global_position = offset + i + 1
+            total_to_process = offset + len(to_check)
+            
+            print(f"[{global_position}/{total_to_process}] Checking {name} [{mbid}] ...", end="", flush=True)
+            
+            try:
+                status, last_code, attempts_used, response_time = await check_mbid_with_cache_warming(
+                    session,
+                    mbid,
+                    cfg["target_base_url"],
+                    cfg["max_attempts_per_artist"],
+                    cfg["delay_between_attempts"],
+                    cfg["timeout_seconds"]
+                )
+                
+                rate_limiter.release(int(last_code) if last_code.isdigit() else last_code, response_time)
+                
+                # Update ledger
+                ledger[mbid].update({
+                    "status": status,
+                    "attempts": attempts_used,
+                    "last_status_code": last_code,
+                    "last_checked": iso_now()
+                })
+                
+                # Count results
+                if status == "success":
+                    new_successes += 1
+                    print(f" SUCCESS (code={last_code}, attempts={attempts_used})")
+                else:
+                    new_failures += 1
+                    print(f" TIMEOUT (code={last_code}, attempts={attempts_used})")
+                
+                # Trigger Lidarr refresh if configured
+                if (cfg.get("update_lidarr", False) 
+                    and status == "success" 
+                    and prev_status in ("", "timeout")):
+                    artist_id = mbid_to_lidarr_id.get(mbid)
+                    trigger_lidarr_refresh(cfg["lidarr_url"], cfg["api_key"], artist_id)
+                    transitioned_count += 1
+                    print(f"  -> Triggered Lidarr refresh for {name} [artist_id={artist_id}]")
+                
+            except Exception as e:
+                response_time = 1.0  # Estimate for failed requests
+                rate_limiter.release("EXC", response_time)
+                
+                ledger[mbid].update({
+                    "status": "timeout",
+                    "attempts": cfg["max_attempts_per_artist"],
+                    "last_status_code": f"EXC:{type(e).__name__}",
+                    "last_checked": iso_now()
+                })
+                
+                new_failures += 1
+                print(f" TIMEOUT (code=EXC:{type(e).__name__}, attempts={cfg['max_attempts_per_artist']})")
+            
+            # Batch writing
+            if global_position % cfg.get("batch_write_frequency", 5) == 0:
+                write_ledger(cfg["csv_path"], ledger)
+            
+            # Progress reporting with correct calculations across all batches
+            if global_position % cfg.get("log_progress_every_n", 25) == 0:
+                elapsed_time = time.time() - overall_start_time
+                artists_per_sec = global_position / max(elapsed_time, 0.1)
+                remaining_artists = total_to_process - global_position
+                eta_seconds = remaining_artists / max(artists_per_sec, 0.01)
+                
+                # Calculate ETC (Estimated Time to Completion)
+                etc_timestamp = datetime.now() + timedelta(seconds=eta_seconds)
+                etc_str = etc_timestamp.strftime("%H:%M")
+                
+                stats = rate_limiter.get_stats()
+                
+                print(f"Progress: {global_position}/{total_to_process} ({(global_position/total_to_process*100):.1f}%) - "
+                      f"Rate: {artists_per_sec:.1f} artists/sec - ETC: {etc_str} - "
+                      f"API: {stats.get('current_rate', 'N/A')}")
+    
+    return transitioned_count, new_successes, new_failures
 
 
 # Remove the global start_run_time since we're now tracking it properly per batch
@@ -722,7 +842,7 @@ def main():
         else:
             # Process all at once for smaller sets
             transitioned_count, new_successes, new_failures = asyncio.run(
-                check_mbids_concurrent(to_check, cfg, ledger, mbid_to_name, mbid_to_lidarr_id)
+                check_mbids_concurrent_with_timing(to_check, cfg, ledger, mbid_to_name, mbid_to_lidarr_id, time.time(), 0)
             )
 
     except KeyboardInterrupt:
