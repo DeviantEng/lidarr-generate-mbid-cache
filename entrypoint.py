@@ -18,9 +18,16 @@ api_key  = REPLACE_WITH_YOUR_LIDARR_API_KEY
 [probe]
 # API to probe for each MBID
 target_base_url = https://api.lidarr.audio/api/v0.4
-max_attempts    = 10
-delay_seconds   = 1
-timeout_seconds = 5
+timeout_seconds = 10
+
+# Concurrent request settings
+max_concurrent_requests = 5
+rate_limit_per_second = 3
+
+# Circuit breaker settings
+circuit_breaker_threshold = 25
+backoff_factor = 2.0
+max_backoff_seconds = 60
 
 [ledger]
 # For Docker single-volume usage, keep this as /data/mbids.csv
@@ -29,6 +36,8 @@ csv_path = /data/mbids.csv
 [run]
 # Re-check successes if true (or pass --force via env FORCE_RUN=true)
 force = false
+batch_size = 25
+batch_write_frequency = 5
 
 [actions]
 # If true, when a probe transitions from (no status or timeout) -> success,
@@ -39,6 +48,10 @@ update_lidarr = false
 # Run every N seconds (>=1). Example: 3600 = hourly
 interval_seconds = 3600
 run_at_start = true
+
+[monitoring]
+log_progress_every_n = 25
+log_level = INFO
 '''
 
 STOP = False

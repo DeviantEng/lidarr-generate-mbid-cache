@@ -1,34 +1,96 @@
 # lidarr-generate-mbid-cache
 
-Collect all artist MBIDs from your **Lidarr** instance and probe them against an API (default: `https://api.lidarr.audio/api/v0.4`).  
-Results are stored in a CSV ledger (`mbids.csv`) with status, attempts, and timestamps.  
-Run once locally or continuously on a schedule (inside Docker).
+Cache warming tool for **Lidarr** artist MusicBrainz IDs (MBIDs). Fetches all artists from your Lidarr instance and repeatedly probes each MBID against an API endpoint (default: `api.lidarr.audio`) until successful, triggering cache generation in the backend.
+
+**Perfect for new APIs with limited cache coverage** - keeps trying each artist until the cache warms up and returns data.
+
+## What It Does
+
+1. **Fetches all artists** from your Lidarr instance
+2. **Repeatedly queries** each MBID against the target API (up to 25 attempts by default)
+3. **Tracks status** in a CSV ledger (`mbids.csv`) - safe to stop/restart anytime
+4. **Concurrent processing** - checks 5 artists simultaneously at 3 requests/second
+5. **Optional Lidarr refresh** - triggers metadata refresh when cache warming succeeds
+
+## Requirements
+
+- **Lidarr instance** with API access
+- **Target API** to warm (default: `https://api.lidarr.audio/api/v0.4`)
+- **Docker** (recommended) or **Python 3.8+**
 
 ---
 
-## Key Features
+## 🐳 Docker (Recommended)
 
-- **Auto-config bootstrap**: On first run, creates `/data/config.ini` with sensible defaults.
-- **CSV ledger**: Keeps `mbids.csv` up to date; safe to stop/restart mid-run.
-- **Force quick refresh**: `--force` (or `[run] force = true`) makes a fast pass with `max_attempts = 1` to quickly re-evaluate cache status.
-- **Results log per run**: After every run, writes `/data/results_YYYYMMDDTHHMMSSZ.log` with success/timeout counts, total, force flag, and timestamp.
-- **Optional Lidarr refresh**: When `[actions] update_lidarr = true`, any MBID that transitions from `""` (no status) or `timeout` → `success` triggers a **non-blocking** refresh request to your local Lidarr (fire-and-forget).
-
----
-
-## 1) Run Locally
-
-Clone and install:
+### Quick Start
 
 ```bash
+# Create data directory
+mkdir -p ./data
+
+# Run container (will create config and exit)
+docker run -d --name lidarr-cache -v $(pwd)/data:/data ghcr.io/devianteng/lidarr-generate-mbid-cache:latest
+
+# Edit config with your Lidarr API key
+nano ./data/config.ini
+
+# Restart container
+docker restart lidarr-cache
+
+# Monitor logs
+docker logs -f lidarr-cache
+```
+
+### Docker Compose
+
+```yaml
+version: '3.8'
+
+services:
+  lidarr-generate-mbid-cache:
+    image: ghcr.io/devianteng/lidarr-generate-mbid-cache:latest
+    container_name: lidarr-cache
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    # Optional environment variables:
+    # environment:
+    #   FORCE_RUN: "true"    # Pass --force to scheduled runs
+```
+
+Then:
+```bash
+docker compose up -d
+docker compose logs -f lidarr-generate-mbid-cache
+```
+
+---
+
+## 🐍 Manual Python Installation
+
+```bash
+# Clone and setup
 git clone https://github.com/devianteng/lidarr-generate-mbid-cache.git
 cd lidarr-generate-mbid-cache
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+
+# Run once (creates config.ini)
+python lidarr_mbid_check.py --config config.ini
+
+# Edit config.ini with your Lidarr API key, then:
+python lidarr_mbid_check.py --config config.ini
+
+# Or run on schedule:
+python entrypoint.py
 ```
 
-Create `config.ini` (auto-created on first run if missing):
+---
+
+## ⚙️ Configuration
+
+On first run, creates `config.ini` with these key settings:
 
 ```ini
 [lidarr]
@@ -37,117 +99,73 @@ api_key  = REPLACE_WITH_YOUR_LIDARR_API_KEY
 
 [probe]
 target_base_url = https://api.lidarr.audio/api/v0.4
-max_attempts    = 10
-delay_seconds   = 1
-timeout_seconds = 5
-
-[ledger]
-csv_path = ./mbids.csv
-
-[run]
-# When true or when passing --force, the run re-checks all MBIDs
-# and hard-sets max_attempts=1 for a fast refresh pass.
-force = false
-
-[actions]
-# When true, if a probe transitions from no status/timeout -> success,
-# trigger a non-blocking refresh of that artist in Lidarr.
-update_lidarr = false
+max_attempts_per_artist = 25    # Try each artist up to 25 times
+delay_between_attempts = 0.5    # Wait between attempts
+max_concurrent_requests = 5     # Simultaneous requests
+rate_limit_per_second = 3       # Max API calls per second
 
 [schedule]
-interval_seconds = 3600
-run_at_start = true
+interval_seconds = 3600         # Run every hour
+max_runs = 50                   # Stop after 50 scheduled runs
 ```
 
-Run it once:
+### Key Settings
 
-```bash
-python lidarr_mbid_check.py --config config.ini
+- **`max_attempts_per_artist`**: How many times to retry each artist (default: 25)
+- **`rate_limit_per_second`**: API rate limit protection (default: 3 req/sec)
+- **`max_concurrent_requests`**: Simultaneous artists being processed (default: 5)
+- **`update_lidarr`**: Set to `true` to refresh Lidarr when cache warming succeeds
+
+---
+
+## 📊 Output & Monitoring
+
+### Console Output
+```
+Discovered 1247 artists (23 new).
+Will check 156 MBIDs (pending-only).
+
+[1/156] Checking Artist Name [mbid-here] ... SUCCESS (code=200, attempts=8)
+[2/156] Checking Another Artist [mbid-here] ... TIMEOUT (code=503, attempts=25)
+[3/156] Checking Third Artist [mbid-here] ... SUCCESS (code=200, attempts=1)
+
+Progress: 25/156 (16.0%) - Rate: 2.8/sec - ETA: 3.1min - API: 2.95 req/sec
+
+Summary:
+  Total in ledger: 1247
+  Success: 1198
+  Timeout: 49
+  Refreshes triggered (new successes): 12
 ```
 
-Force quick refresh pass (max_attempts=1):
+### Generated Files
+- **`/data/mbids.csv`** - Main ledger with all MBID statuses
+- **`/data/results_YYYYMMDDTHHMMSSZ.log`** - Simple metrics per run
+
+---
+
+## 🔧 CLI Options
 
 ```bash
+# Force re-check all MBIDs (including successful ones)
 python lidarr_mbid_check.py --config config.ini --force
-```
 
-Or run continuously on the schedule:
-
-```bash
-python entrypoint.py
+# Preview what would be checked without API calls
+python lidarr_mbid_check.py --config config.ini --dry-run
 ```
 
 ---
 
-## 2) Run with Docker
+## 💡 Tips
 
-### Docker Run (single volume)
-
-Mount one folder containing `config.ini` (and where `mbids.csv` and results logs will be created):
-
-```bash
-docker run -d   --name lidarr-generate-mbid-cache   -v $(pwd)/data:/data   ghcr.io/devianteng/lidarr-generate-mbid-cache:latest
-```
-
-(Optional) Force quick refresh run via env from the scheduler:
-
-```bash
-docker run -d   --name lidarr-generate-mbid-cache   -e FORCE_RUN=true   -v $(pwd)/data:/data   ghcr.io/devianteng/lidarr-generate-mbid-cache:latest
-```
-
-### Docker Compose
-
-Example `docker-compose.yml`:
-
-```yaml
-version: '3.8'
-
-services:
-  lidarr-generate-mbid-cache:
-    image: ghcr.io/devianteng/lidarr-generate-mbid-cache:latest
-    container_name: lidarr-generate-mbid-cache
-    restart: unless-stopped
-    volumes:
-      - ./data:/data
-    # environment:
-    #   FORCE_RUN: "true"   # optional: pass --force to the scheduled runs
-```
-
-Then:
-
-```bash
-docker compose up -d
-docker compose logs -f lidarr-generate-mbid-cache
-```
+- **Start conservative** with default settings (3 req/sec, 25 attempts)
+- **Monitor the logs** for rate limiting warnings
+- **Large libraries**: Processing happens in batches with frequent progress saves
+- **Interruption-safe**: Can stop/restart anytime - progress is saved to CSV
+- **Cache warming**: Once an artist succeeds, it's cached and won't need re-processing
 
 ---
 
-## Outputs
+## 🔗 Integration
 
-- **CSV Ledger**: `/data/mbids.csv` (or as configured)
-- **Results Logs**: `/data/results_YYYYMMDDTHHMMSSZ.log` per run, containing:
-  ```
-  finished_at_utc=2025-08-24T15:30:12.345678+00:00
-  success=<count>
-  timeout=<count>
-  total=<count>
-  force_mode=true|false
-  refreshes_triggered=<count>
-  ```
-
----
-
-## Scheduling Notes
-
-- The scheduler runs the script, then sleeps for `[schedule] interval_seconds`.  
-  For example, with `interval_seconds = 3600`, you get: _run duration_ + **1 hour** idle before the next run.  
-- To align to wall-clock times (cron-style), we can switch to a cron expression system on request.
-
----
-
-## Tips
-
-- First run inside Docker will create `/data/config.ini` and exit—fill in your API key and re-run.
-- If you change probe parameters (attempts, delay), re-running will pick up the changes from `config.ini`.
-- `update_lidarr = true` fires a **non-blocking** refresh only when a row transitions from no status/timeout → success.
-
+Set `update_lidarr = true` in config to automatically trigger Lidarr artist refreshes when cache warming succeeds. This helps keep your Lidarr metadata up-to-date as the backend cache grows.

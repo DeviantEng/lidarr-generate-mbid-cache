@@ -1,2 +1,5 @@
 # requirements.txt
+# Enhanced version with async support for concurrent cache warming
+
 requests>=2.25.0,<3
+aiohttp>=3.8.0,<4
