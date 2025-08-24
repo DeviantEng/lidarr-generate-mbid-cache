@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local config & secrets
+mbid_config.ini
+mbid_config*.ini
+.env
+*.key
+*.pem
+
+# Runtime artifacts
+mbids.csv
+logs/
+*.log
+
