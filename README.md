@@ -1,31 +1,26 @@
 # Lidarr MBID Probe
 
-Script that:
-1) Pulls all artist MBIDs from your **Lidarr** instance  
-2) Keeps a CSV ledger of MBIDs and probe results  
-3) Probes each MBID against a target endpoint (default: `https://api.lidarr.audio/api/v0.4/artist/{MBID}`)  
-4) Retries per MBID up to a configurable max with a delay; records `success` or `timeout`
-
-## Features
-- Config-driven via INI (no secrets on the CLI)
-- Idempotent CSV ledger (`mbids.csv`): `mbid,artist_name,status,attempts,last_status_code,last_checked`
-- Adds new MBIDs; re-checks only those that previously failed or have no status
-- `--force` flag to re-check everything
+A tool to collect all artist MBIDs from your **Lidarr** instance and probe them against an API (default: `https://api.lidarr.audio/api/v0.4`).  
+Results are stored in a CSV ledger (`mbids.csv`) with status, attempts, and timestamps.  
+The script can run once manually or on a recurring schedule (inside Docker).
 
 ---
 
-## Setup (local / venv)
+## 1. Run Locally
+
+Clone and install:
 
 ```bash
+git clone https://github.com/devianteng/lidarr-mbid-probe.git
+cd lidarr-mbid-probe
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create a config file (example):
+Create a `config.ini`:
 
 ```ini
-# mbid_config.ini
 [lidarr]
 base_url = http://172.16.100.203:15111
 api_key  = REPLACE_WITH_YOUR_LIDARR_API_KEY
@@ -33,7 +28,7 @@ api_key  = REPLACE_WITH_YOUR_LIDARR_API_KEY
 [probe]
 target_base_url = https://api.lidarr.audio/api/v0.4
 max_attempts    = 10
-delay_seconds   = 1.0
+delay_seconds   = 1
 timeout_seconds = 20
 
 [ledger]
@@ -41,77 +36,75 @@ csv_path = ./mbids.csv
 
 [run]
 force = false
+
+[schedule]
+interval_seconds = 3600
+run_at_start = true
 ```
 
-Run it:
+Run it once:
 
 ```bash
-python lidarr_mbid_check.py --config mbid_config.ini
-# or
-python lidarr_mbid_check.py --config mbid_config.ini --force
+python lidarr_mbid_check.py --config config.ini
+```
+
+Or run continuously on the schedule:
+
+```bash
+python entrypoint.py
 ```
 
 ---
 
-## Docker (single volume)
+## 2. Run with Docker
 
-Keep both your config and CSV in the same host folder (e.g., `./lidarr-data`):
-
-```
-./lidarr-data/
-  ├─ mbid_config.ini
-  └─ mbids.csv   (created automatically on first run)
-```
-
-Build:
+### Docker Run
+Mount a single folder containing `config.ini` (and where `mbids.csv` will be created):
 
 ```bash
-docker build -t lidarr-mbid-probe:latest .
+docker run -d \
+  --name lidarr-mbid-probe \
+  -v $(pwd)/data:/data \
+  ghcr.io/devianteng/lidarr-generate-mbid-cache:latest
 ```
 
-Run:
+### Docker Compose
+Create `docker-compose.yml`:
 
-```bash
-docker run --rm \
-  -v "$(pwd)/lidarr-data:/data" \
-  lidarr-mbid-probe:latest
+```yaml
+version: '3.8'
+
+services:
+  lidarr-mbid-probe:
+    image: ghcr.io/devianteng/lidarr-generate-mbid-cache:latest
+    container_name: lidarr-mbid-probe
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
 ```
 
-Force re-check:
+Then:
 
 ```bash
-docker run --rm \
-  -v "$(pwd)/lidarr-data:/data" \
-  lidarr-mbid-probe:latest --force
+docker compose up -d
+docker compose logs -f lidarr-mbid-probe
 ```
 
 ---
 
-## Config options
+## Config Options
 
 - **[lidarr]**
-  - `base_url`: Your Lidarr base URL (e.g., `http://172.16.100.203:15111`)
-  - `api_key`: Lidarr API Key
-
-- **[probe]**
-  - `target_base_url`: Base API to probe (default: `https://api.lidarr.audio/api/v0.4`)
-  - `max_attempts`: Tries per MBID (default: 10)
-  - `delay_seconds`: Sleep between attempts (default: 1.0)
-  - `timeout_seconds`: Per-request timeout (default: 20)
-
-- **[ledger]**
-  - `csv_path`: Where to store the ledger
-
-- **[run]**
-  - `force`: `true|false` to re-check all entries
+  - `base_url`: Your Lidarr instance (e.g., `http://172.16.100.203:15111`)
+  - `api_key`: Lidarr API key
+- **[probe]** – retry/delay/timeout behavior  
+- **[ledger]** – path to CSV ledger  
+- **[run]** – force re-checks  
+- **[schedule]** – interval and behavior when running via Docker/entrypoint  
 
 ---
 
 ## Notes
-- Interrupt/resume safe: the CSV is rewritten after each MBID.
-- If the Lidarr endpoint differs (older/newer builds), the script tries multiple artist API paths.
-- If you prefer JSON over CSV later, the read/write functions can be swapped easily.
-
-## License
-MIT (or your preference)
+- Interrupt/resume safe: the CSV is updated after each MBID.
+- By default the Docker container runs forever, following the schedule in `config.ini`.
 
