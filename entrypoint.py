@@ -7,24 +7,62 @@ import sys
 import time
 from datetime import datetime
 
+DEFAULT_CONFIG = '''# config.ini
+# Generated automatically on first run. Edit and set your Lidarr API key.
+
+[lidarr]
+# Default Lidarr URL
+base_url = http://192.168.1.103:8686
+api_key  = REPLACE_WITH_YOUR_LIDARR_API_KEY
+
+[probe]
+# API to probe for each MBID
+target_base_url = https://api.lidarr.audio/api/v0.4
+max_attempts    = 10
+delay_seconds   = 1
+timeout_seconds = 5
+
+[ledger]
+# For Docker single-volume usage, keep this as /data/mbids.csv
+csv_path = /data/mbids.csv
+
+[run]
+# Re-check successes if true (or pass --force to the script directly by editing entrypoint.py if desired)
+force = false
+
+[schedule]
+# Run every N seconds (>=1). Example: 3600 = hourly
+interval_seconds = 3600
+run_at_start = true
+'''
+
+
 STOP = False
+
 
 def _sig_handler(signum, frame):
     global STOP
     STOP = True
     print(f"[{datetime.now().isoformat()}] Received signal {signum}. Shutting down after current run...", flush=True)
 
+
 def parse_bool(s: str, default: bool = False) -> bool:
     if s is None:
         return default
     return s.strip().lower() in ("1", "true", "yes", "on")
 
+
 def main():
     # Allow overriding the config path via env var, default to /data/config.ini
     config_path = os.environ.get("CONFIG_PATH", "/data/config.ini")
+
+    # If config is missing, create and exit so the user can fill in the API key.
     if not os.path.exists(config_path):
-        print(f"ERROR: Config not found: {config_path}", file=sys.stderr)
-        sys.exit(2)
+        os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_CONFIG)
+        print(f"[{datetime.now().isoformat()}] Created default config at {config_path}. Please edit api_key and restart.", flush=True)
+        sys.exit(1)
 
     # Load schedule settings
     cp = configparser.ConfigParser()
@@ -32,7 +70,6 @@ def main():
         print(f"ERROR: Could not read config: {config_path}", file=sys.stderr)
         sys.exit(2)
 
-    # Defaults if [schedule] is missing
     interval_seconds = cp.getint("schedule", "interval_seconds", fallback=3600)
     run_at_start     = parse_bool(cp.get("schedule", "run_at_start", fallback="true"))
     jitter_seconds   = cp.getint("schedule", "jitter_seconds", fallback=0)  # optional, default 0
@@ -51,20 +88,19 @@ def main():
 
     while not STOP:
         if first_loop and not run_at_start:
-            # Wait first, then run
             first_loop = False
             delay = interval_seconds
             print(f"[{datetime.now().isoformat()}] Waiting {delay}s before first run...", flush=True)
             time.sleep(delay)
-            if STOP: break
+            if STOP:
+                break
 
         first_loop = False
 
-        # Optionally apply small jitter to avoid synchronized calls across hosts
+        # Optional jitter
         delay_before = 0
         if jitter_seconds > 0:
             try:
-                # Basic, dependency-free jitter
                 delay_before = int.from_bytes(os.urandom(2), "big") % (jitter_seconds + 1)
             except Exception:
                 delay_before = 0
@@ -72,7 +108,8 @@ def main():
         if delay_before > 0:
             print(f"[{datetime.now().isoformat()}] Sleeping jitter {delay_before}s before run...", flush=True)
             time.sleep(delay_before)
-            if STOP: break
+            if STOP:
+                break
 
         # Run the main script once
         print(f"[{datetime.now().isoformat()}] Starting lidarr MBID check...", flush=True)
@@ -99,6 +136,6 @@ def main():
 
     print(f"[{datetime.now().isoformat()}] Exited entrypoint loop.", flush=True)
 
+
 if __name__ == "__main__":
     main()
-

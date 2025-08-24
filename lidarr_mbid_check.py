@@ -10,6 +10,35 @@ from typing import Dict, List, Tuple
 
 import requests
 
+DEFAULT_CONFIG = '''# config.ini
+# Generated automatically on first run. Edit and set your Lidarr API key.
+
+[lidarr]
+# Default Lidarr URL
+base_url = http://192.168.1.103:8686
+api_key  = REPLACE_WITH_YOUR_LIDARR_API_KEY
+
+[probe]
+# API to probe for each MBID
+target_base_url = https://api.lidarr.audio/api/v0.4
+max_attempts    = 10
+delay_seconds   = 1
+timeout_seconds = 5
+
+[ledger]
+# For Docker single-volume usage, keep this as /data/mbids.csv
+csv_path = /data/mbids.csv
+
+[run]
+# Re-check successes if true or use --force CLI flag
+force = false
+
+[schedule]
+# Used by entrypoint.py (scheduler) if you run that directly
+interval_seconds = 3600
+run_at_start = true
+'''
+
 
 def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -98,7 +127,7 @@ def check_mbid(
     target_base_url: str,
     max_attempts: int = 10,
     delay_seconds: float = 1.0,
-    timeout: int = 20,
+    timeout: int = 5,
 ) -> Tuple[str, str, int]:
     """
     Try the target endpoint up to max_attempts, return (status, last_status_code, attempts_used)
@@ -133,10 +162,18 @@ def parse_bool(s: str, default: bool = False) -> bool:
 def load_config(path: str) -> dict:
     """
     Load INI config and return a normalized dict of settings with defaults.
+    If config.ini is missing, create it with DEFAULT_CONFIG and exit with code 1.
     """
     # Accept bare name without extension by appending .ini if needed
     if not os.path.exists(path) and os.path.exists(path + ".ini"):
         path = path + ".ini"
+
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_CONFIG)
+        print(f"Created default config at {path}. Please edit api_key before running again.", file=sys.stderr)
+        sys.exit(1)
 
     cp = configparser.ConfigParser()
     if not cp.read(path, encoding="utf-8"):
@@ -144,18 +181,19 @@ def load_config(path: str) -> dict:
 
     # Defaults
     cfg = {
-        "lidarr_url": cp.get("lidarr", "base_url", fallback="http://127.0.0.1:8686"),
+        "lidarr_url": cp.get("lidarr", "base_url", fallback="http://192.168.1.103:8686"),
         "api_key": cp.get("lidarr", "api_key", fallback=""),
         "target_base_url": cp.get("probe", "target_base_url", fallback="https://api.lidarr.audio/api/v0.4"),
         "max_attempts": cp.getint("probe", "max_attempts", fallback=10),
         "delay_seconds": cp.getfloat("probe", "delay_seconds", fallback=1.0),
-        "timeout_seconds": cp.getint("probe", "timeout_seconds", fallback=20),
+        "timeout_seconds": cp.getint("probe", "timeout_seconds", fallback=5),
         "csv_path": cp.get("ledger", "csv_path", fallback="mbids.csv"),
         "force": parse_bool(cp.get("run", "force", fallback="false")),
     }
 
-    if not cfg["api_key"]:
-        raise ValueError("Missing [lidarr].api_key in config.")
+    if not cfg["api_key"] or "REPLACE_WITH_YOUR_LIDARR_API_KEY" in cfg["api_key"]:
+        raise ValueError("Missing [lidarr].api_key in config (or still using the placeholder).")
+
     return cfg
 
 
@@ -163,7 +201,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Query Lidarr for MBIDs, keep a CSV ledger, and probe each MBID against a target endpoint."
     )
-    parser.add_argument("--config", required=True, help="Path to INI config (e.g., mbid_config or mbid_config.ini)")
+    parser.add_argument("--config", required=True, help="Path to INI config (e.g., /data/config.ini)")
     # Optional overrides (CLI takes precedence over config if provided)
     parser.add_argument("--force", action="store_true", help="Re-run checks even for MBIDs already marked success")
     args = parser.parse_args()
