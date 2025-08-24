@@ -6,6 +6,16 @@ Run once locally or continuously on a schedule (inside Docker).
 
 ---
 
+## Key Features
+
+- **Auto-config bootstrap**: On first run, creates `/data/config.ini` with sensible defaults.
+- **CSV ledger**: Keeps `mbids.csv` up to date; safe to stop/restart mid-run.
+- **Force quick refresh**: `--force` (or `[run] force = true`) makes a fast pass with `max_attempts = 1` to quickly re-evaluate cache status.
+- **Results log per run**: After every run, writes `/data/results_YYYYMMDDTHHMMSSZ.log` with success/timeout counts, total, force flag, and timestamp.
+- **Optional Lidarr refresh**: When `[actions] update_lidarr = true`, any MBID that transitions from `""` (no status) or `timeout` → `success` triggers a **non-blocking** refresh request to your local Lidarr (fire-and-forget).
+
+---
+
 ## 1) Run Locally
 
 Clone and install:
@@ -35,7 +45,14 @@ timeout_seconds = 5
 csv_path = ./mbids.csv
 
 [run]
+# When true or when passing --force, the run re-checks all MBIDs
+# and hard-sets max_attempts=1 for a fast refresh pass.
 force = false
+
+[actions]
+# When true, if a probe transitions from no status/timeout -> success,
+# trigger a non-blocking refresh of that artist in Lidarr.
+update_lidarr = false
 
 [schedule]
 interval_seconds = 3600
@@ -46,6 +63,12 @@ Run it once:
 
 ```bash
 python lidarr_mbid_check.py --config config.ini
+```
+
+Force quick refresh pass (max_attempts=1):
+
+```bash
+python lidarr_mbid_check.py --config config.ini --force
 ```
 
 Or run continuously on the schedule:
@@ -60,13 +83,16 @@ python entrypoint.py
 
 ### Docker Run (single volume)
 
-Mount one folder containing `config.ini` (and where `mbids.csv` will be created):
+Mount one folder containing `config.ini` (and where `mbids.csv` and results logs will be created):
 
 ```bash
-docker run -d \
-  --name lidarr-generate-mbid-cache \
-  -v $(pwd)/data:/data \
-  ghcr.io/devianteng/lidarr-generate-mbid-cache:latest
+docker run -d   --name lidarr-generate-mbid-cache   -v $(pwd)/data:/data   ghcr.io/devianteng/lidarr-generate-mbid-cache:latest
+```
+
+(Optional) Force quick refresh run via env from the scheduler:
+
+```bash
+docker run -d   --name lidarr-generate-mbid-cache   -e FORCE_RUN=true   -v $(pwd)/data:/data   ghcr.io/devianteng/lidarr-generate-mbid-cache:latest
 ```
 
 ### Docker Compose
@@ -83,6 +109,8 @@ services:
     restart: unless-stopped
     volumes:
       - ./data:/data
+    # environment:
+    #   FORCE_RUN: "true"   # optional: pass --force to the scheduled runs
 ```
 
 Then:
@@ -94,21 +122,32 @@ docker compose logs -f lidarr-generate-mbid-cache
 
 ---
 
-## Config Options
+## Outputs
 
-- **[lidarr]**
-  - `base_url`: Your Lidarr instance (default `http://192.168.1.103:8686`)
-  - `api_key`: Lidarr API key
-- **[probe]** – retry/delay/timeout behavior (default timeout is **5s**)  
-- **[ledger]** – path to CSV ledger  
-- **[run]** – force re-checks  
-- **[schedule]** – interval and behavior when running via Docker/entrypoint  
+- **CSV Ledger**: `/data/mbids.csv` (or as configured)
+- **Results Logs**: `/data/results_YYYYMMDDTHHMMSSZ.log` per run, containing:
+  ```
+  finished_at_utc=2025-08-24T15:30:12.345678+00:00
+  success=<count>
+  timeout=<count>
+  total=<count>
+  force_mode=true|false
+  refreshes_triggered=<count>
+  ```
 
 ---
 
-## Notes
+## Scheduling Notes
 
-- First run will create a default `config.ini` if missing and exit with a message so you can fill in the API key.  
-- CSV is updated after each MBID; safe to interrupt and resume.  
-- By default the Docker container runs forever, following the schedule in `config.ini`.
+- The scheduler runs the script, then sleeps for `[schedule] interval_seconds`.  
+  For example, with `interval_seconds = 3600`, you get: _run duration_ + **1 hour** idle before the next run.  
+- To align to wall-clock times (cron-style), we can switch to a cron expression system on request.
+
+---
+
+## Tips
+
+- First run inside Docker will create `/data/config.ini` and exit—fill in your API key and re-run.
+- If you change probe parameters (attempts, delay), re-running will pick up the changes from `config.ini`.
+- `update_lidarr = true` fires a **non-blocking** refresh only when a row transitions from no status/timeout → success.
 

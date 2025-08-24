@@ -27,8 +27,13 @@ timeout_seconds = 5
 csv_path = /data/mbids.csv
 
 [run]
-# Re-check successes if true (or pass --force to the script directly by editing entrypoint.py if desired)
+# Re-check successes if true (or pass --force via env FORCE_RUN=true)
 force = false
+
+[actions]
+# If true, when a probe transitions from (no status or timeout) -> success,
+# trigger a non-blocking refresh of that artist in Lidarr.
+update_lidarr = false
 
 [schedule]
 # Run every N seconds (>=1). Example: 3600 = hourly
@@ -36,21 +41,17 @@ interval_seconds = 3600
 run_at_start = true
 '''
 
-
 STOP = False
-
 
 def _sig_handler(signum, frame):
     global STOP
     STOP = True
     print(f"[{datetime.now().isoformat()}] Received signal {signum}. Shutting down after current run...", flush=True)
 
-
 def parse_bool(s: str, default: bool = False) -> bool:
     if s is None:
         return default
     return s.strip().lower() in ("1", "true", "yes", "on")
-
 
 def main():
     # Allow overriding the config path via env var, default to /data/config.ini
@@ -113,8 +114,13 @@ def main():
 
         # Run the main script once
         print(f"[{datetime.now().isoformat()}] Starting lidarr MBID check...", flush=True)
+        extra = []
+        # Optional: FORCE_RUN=true to pass --force through the scheduler
+        if os.environ.get("FORCE_RUN", "false").lower() in ("1", "true", "yes", "on"):
+            extra.append("--force")
+
         proc = subprocess.run(
-            ["python", "/app/lidarr_mbid_check.py", "--config", config_path],
+            ["python", "/app/lidarr_mbid_check.py", "--config", config_path] + extra,
             stdout=sys.stdout,
             stderr=sys.stderr,
         )

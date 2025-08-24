@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import requests
 
@@ -33,6 +33,11 @@ csv_path = /data/mbids.csv
 # Re-check successes if true or use --force CLI flag
 force = false
 
+[actions]
+# If true, when a probe transitions from (no status or timeout) -> success,
+# trigger a non-blocking refresh of that artist in Lidarr.
+update_lidarr = false
+
 [schedule]
 # Used by entrypoint.py (scheduler) if you run that directly
 interval_seconds = 3600
@@ -46,7 +51,7 @@ def iso_now() -> str:
 
 def get_lidarr_artists(base_url: str, api_key: str, timeout: int = 30) -> List[Dict]:
     """
-    Fetch artists from Lidarr and return a list of dicts with {name, mbid}.
+    Fetch artists from Lidarr and return a list of dicts with {id, name, mbid}.
     Tries common Lidarr API paths and fields.
     """
     session = requests.Session()
@@ -71,8 +76,9 @@ def get_lidarr_artists(base_url: str, api_key: str, timeout: int = 30) -> List[D
             for a in data:
                 mbid = a.get("foreignArtistId") or a.get("mbId") or a.get("mbid")
                 name = a.get("artistName") or a.get("name") or "Unknown"
+                lidarr_id = a.get("id")  # internal Lidarr artist id
                 if mbid:
-                    artists.append({"name": name, "mbid": mbid})
+                    artists.append({"id": lidarr_id, "name": name, "mbid": mbid})
             return artists
         except Exception as e:
             last_exc = e
@@ -189,6 +195,7 @@ def load_config(path: str) -> dict:
         "timeout_seconds": cp.getint("probe", "timeout_seconds", fallback=5),
         "csv_path": cp.get("ledger", "csv_path", fallback="mbids.csv"),
         "force": parse_bool(cp.get("run", "force", fallback="false")),
+        "update_lidarr": parse_bool(cp.get("actions", "update_lidarr", fallback="false")),
     }
 
     if not cfg["api_key"] or "REPLACE_WITH_YOUR_LIDARR_API_KEY" in cfg["api_key"]:
@@ -197,13 +204,40 @@ def load_config(path: str) -> dict:
     return cfg
 
 
+def trigger_lidarr_refresh(base_url: str, api_key: str, artist_id: Optional[int]) -> None:
+    """
+    Fire-and-forget refresh request to Lidarr for the given artist id.
+    Uses the command endpoint; very short timeout so we don't block.
+    """
+    if artist_id is None:
+        return
+    session = requests.Session()
+    headers = {"X-Api-Key": api_key}
+    # Prefer v1 command; fall back to older if needed
+    payloads = [
+        {"name": "RefreshArtist", "artistIds": [artist_id]},
+        {"name": "RefreshArtist", "artistId": artist_id},
+    ]
+    for path in ("/api/v1/command", "/api/command"):
+        url = f"{base_url.rstrip('/')}{path}"
+        for body in payloads:
+            try:
+                # short timeout; ignore response
+                session.post(url, headers=headers, json=body, timeout=0.5)
+                return
+            except Exception:
+                continue
+    # Swallow all failures silently (intentionally non-blocking).
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Query Lidarr for MBIDs, keep a CSV ledger, and probe each MBID against a target endpoint."
     )
     parser.add_argument("--config", required=True, help="Path to INI config (e.g., /data/config.ini)")
     # Optional overrides (CLI takes precedence over config if provided)
-    parser.add_argument("--force", action="store_true", help="Re-run checks even for MBIDs already marked success")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-run checks even for MBIDs already marked success (also sets max_attempts=1 for a quick refresh)")
     args = parser.parse_args()
 
     try:
@@ -214,16 +248,26 @@ def main():
 
     if args.force:
         cfg["force"] = True
+        # For 'quick refresh', override attempts to 1 regardless of config
+        cfg["max_attempts"] = 1
+        print("[INFO] Force mode enabled: max_attempts hard-set to 1 for quick refresh.")
 
     # 1) Load ledger
     ledger = read_ledger(cfg["csv_path"])
 
-    # 2) Fetch current artists/MBIDs from Lidarr
+    # 2) Fetch current artists/MBIDs (and Lidarr IDs) from Lidarr
     try:
         artists = get_lidarr_artists(cfg["lidarr_url"], cfg["api_key"])
     except Exception as e:
         print(f"ERROR fetching Lidarr artists: {e}", file=sys.stderr)
         sys.exit(2)
+
+    # Build helper mappings
+    mbid_to_lidarr_id: Dict[str, Optional[int]] = {}
+    mbid_to_name: Dict[str, str] = {}
+    for a in artists:
+        mbid_to_lidarr_id[a["mbid"]] = a.get("id")
+        mbid_to_name[a["mbid"]] = a.get("name", "")
 
     # 3) Merge in any new MBIDs (with empty status)
     new_count = 0
@@ -255,8 +299,11 @@ def main():
     print(f"Will check {len(to_check)} MBIDs ({'force' if cfg['force'] else 'pending-only'}).")
 
     # 5) Probe each MBID as needed
+    transitioned_to_success_count = 0
     for i, mbid in enumerate(to_check, start=1):
-        name = ledger[mbid].get("artist_name", "")
+        name = ledger[mbid].get("artist_name") or mbid_to_name.get(mbid, "")
+        prev_status = (ledger[mbid].get("status") or "").lower()
+
         print(f"[{i}/{len(to_check)}] Checking {name or '(unknown)'} [{mbid}] ...", end="", flush=True)
         status, last_code, attempts_used = check_mbid(
             mbid,
@@ -271,6 +318,17 @@ def main():
         ledger[mbid]["last_checked"] = iso_now()
         print(f" {status.upper()} (code={last_code}, attempts={attempts_used})")
 
+        # NEW: If we transitioned from "" or "timeout" -> "success", trigger Lidarr refresh (fire-and-forget)
+        if (
+            cfg.get("update_lidarr", False)
+            and status == "success"
+            and prev_status in ("", "timeout")
+        ):
+            artist_id = mbid_to_lidarr_id.get(mbid)
+            trigger_lidarr_refresh(cfg["lidarr_url"], cfg["api_key"], artist_id)
+            transitioned_to_success_count += 1
+            print(f"  -> Triggered Lidarr refresh for {name or '(unknown)'} [artist_id={artist_id}]")
+
         # Persist after each row so you can safely stop/restart
         write_ledger(cfg["csv_path"], ledger)
 
@@ -284,9 +342,25 @@ def main():
     print(f"  Total in ledger: {len(ledger)}")
     print(f"  Success: {successes}")
     print(f"  Timeout: {timeouts}")
+    print(f"  Refreshes triggered (new successes): {transitioned_to_success_count}")
     print(f"\nCSV written to: {cfg['csv_path']}")
+
+    # 7) Write a timestamped results log into /data
+    try:
+        os.makedirs("/data", exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        log_path = f"/data/results_{ts}.log"
+        with open(log_path, "w", encoding="utf-8") as lf:
+            lf.write(f"finished_at_utc={iso_now()}\n")
+            lf.write(f"success={successes}\n")
+            lf.write(f"timeout={timeouts}\n")
+            lf.write(f"total={len(ledger)}\n")
+            lf.write(f"force_mode={'true' if cfg['force'] else 'false'}\n")
+            lf.write(f"refreshes_triggered={transitioned_to_success_count}\n")
+        print(f"Results log written to: {log_path}")
+    except Exception as e:
+        print(f"WARNING: Failed to write results log to /data: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
     main()
-
