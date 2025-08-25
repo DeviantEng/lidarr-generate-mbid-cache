@@ -1,3 +1,9 @@
+# DEPRECATED -- USE THIS INSTEAD:  
+https://github.com/DeviantEng/lidarr-cache-warmer
+---
+.
+.
+.
 # lidarr-generate-mbid-cache
 
 Cache warming tool for **Lidarr** artist MusicBrainz IDs (MBIDs). Fetches all artists from your Lidarr instance and repeatedly probes each MBID against an API endpoint (default: `api.lidarr.audio`) until successful, triggering cache generation in the backend.
