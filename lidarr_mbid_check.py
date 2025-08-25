@@ -645,6 +645,10 @@ async def check_mbids_concurrent_with_timing(
     new_failures = 0
     timeout_obj = aiohttp.ClientTimeout(total=cfg["timeout_seconds"])
     
+    # Track progress stats for this batch
+    batch_successes = 0
+    batch_timeouts = 0
+    
     async with aiohttp.ClientSession(timeout=timeout_obj) as session:
         for i, mbid in enumerate(to_check):
             # Check circuit breaker
@@ -684,9 +688,11 @@ async def check_mbids_concurrent_with_timing(
                 # Count results
                 if status == "success":
                     new_successes += 1
+                    batch_successes += 1
                     print(f" SUCCESS (code={last_code}, attempts={attempts_used})")
                 else:
                     new_failures += 1
+                    batch_timeouts += 1
                     print(f" TIMEOUT (code={last_code}, attempts={attempts_used})")
                 
                 # Trigger Lidarr refresh if configured
@@ -710,13 +716,14 @@ async def check_mbids_concurrent_with_timing(
                 })
                 
                 new_failures += 1
+                batch_timeouts += 1
                 print(f" TIMEOUT (code=EXC:{type(e).__name__}, attempts={cfg['max_attempts_per_artist']})")
             
             # Batch writing
             if global_position % cfg.get("batch_write_frequency", 5) == 0:
                 write_ledger(cfg["csv_path"], ledger)
             
-            # Progress reporting with correct calculations across all batches
+            # Progress reporting with batch stats
             if global_position % cfg.get("log_progress_every_n", 25) == 0:
                 elapsed_time = time.time() - overall_start_time
                 artists_per_sec = global_position / max(elapsed_time, 0.1)
@@ -729,9 +736,12 @@ async def check_mbids_concurrent_with_timing(
                 
                 stats = rate_limiter.get_stats()
                 
+                # Calculate total processed in current batch so far
+                batch_processed = batch_successes + batch_timeouts
+                
                 print(f"Progress: {global_position}/{total_to_process} ({(global_position/total_to_process*100):.1f}%) - "
                       f"Rate: {artists_per_sec:.1f} artists/sec - ETC: {etc_str} - "
-                      f"API: {stats.get('current_rate', 'N/A')}")
+                      f"API: {stats.get('current_rate', 'N/A')} - Batch: {batch_successes}/{batch_processed} success")
     
     return transitioned_count, new_successes, new_failures
 
